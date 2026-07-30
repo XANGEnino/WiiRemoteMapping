@@ -1,0 +1,17 @@
+{
+  "A": "space",
+  "B": "ctrl+z",
+  "One": "2",
+  "Two": "3",
+  "Plus": "enter",
+  "Minus": "9",
+  "Home": "tab",
+  "Up": "up",
+  "Down": "down",
+  "Left": "left",
+  "Right": "right",
+  "SwingUp": "j",
+  "SwingDown": "down",
+  "SwingLeft": "left",
+  "SwingRight": "right"
+}
