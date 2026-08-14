@@ -11,14 +11,16 @@ py -m pip install -r requirements.txt
 
 ## Run
 
-Make sure the Wii remote is connected via Bluetooth (press a button on it to
-wake it up), then:
-
 ```
 py app.py
 ```
 
-The remote's player-1 LED lights up when the app connects.
+The app connects the remote itself — leave **Continuous Scanning** on and press
+a button on the remote. The player-1 LED lights up once it's connected.
+
+The first time a remote meets this PC it has to be paired: hold **1+2** so its
+lights blink, then click **Pair Remote** and keep holding until they stop.
+After that, scanning alone brings it back whenever you press a button.
 
 ## Usage
 
@@ -27,13 +29,31 @@ The remote's player-1 LED lights up when the app connects.
 - The last four rows are **motion swings** — swing the remote up, down, left,
   or right (like grading an Anki card with a flick). A swing taps its key once;
   its indicator flashes green. Forward/back jabs are ignored.
+- The **Motion controls** switch turns the swing bindings on and off, since
+  ordinary hand movement is easily mistaken for a swing. It starts off and its
+  four key labels are greyed out; swings are still detected and still flash
+  their indicator and the compass, they just don't type anything. The switch
+  is remembered in `settings.json`.
 - Click **Set** next to a button or swing, then press the keyboard key you want
   to assign. Combinations work too: hold the modifiers and press the final key
   (e.g. Ctrl+Z is stored as `ctrl+z`). Releasing a modifier without pressing
   another key assigns the modifier by itself. Click **Cancel** to abort.
 - Mappings are saved automatically to `mappings.json`.
-- If the remote powers off (it sleeps when idle), press any button on it and
-  click **Reconnect**.
+- The **Continuous Scanning** switch keeps a background thread hunting for the
+  remote, so it reconnects on its own after it sleeps — just press a button on
+  it. This is Dolphin's "Continuous Scanning" (German: *Durchgehendes Suchen*),
+  and it is what the app was missing: Windows only exposes a remote to
+  applications once something pairs it and switches its HID service back on,
+  and if nothing does that, the remote stays invisible until you open Dolphin
+  and let *its* scanner do the work. The switch is remembered in
+  `settings.json`; **Reconnect** is still there for a one-off attempt.
+- **Pair Remote** runs a Bluetooth inquiry and pairs any remote currently in
+  discovery mode, using the host adapter's address as the pass key (the sync
+  button method). Needed once per remote — a remote paired this way remembers
+  the PC and asks to reconnect on any button press, which is what makes plain
+  scanning enough afterwards. Both are ports of Dolphin's Windows Wiimote
+  scanner (`Source/Core/Core/HW/WiimoteReal/IOWin.cpp`), talking to the same
+  Windows Bluetooth API through `ctypes`.
 - **Motion Viewer** opens a window with a live 3D model of the remote and a
   rolling graph of swing acceleration. Pitch and roll come from the
   accelerometer. Yaw (turning around the vertical axis) uses the MotionPlus
@@ -95,7 +115,7 @@ The remote's player-1 LED lights up when the app connects.
 | − | backspace | |
 | Home | esc | Back to deck list |
 | D-pad | arrow keys | |
-| Swing up | 1 | Again |
+| Swing up | 1 | Again (needs the Motion controls switch on) |
 | Swing down | 2 | Hard |
 | Swing left | 3 | Good |
 | Swing right | 4 | Easy |

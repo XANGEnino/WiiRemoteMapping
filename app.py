@@ -5,6 +5,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
+import btpair
 import config
 import keysender
 from recorder import SwingRecorder
@@ -17,6 +18,12 @@ DISPLAY_ORDER = [
     "Up", "Down", "Left", "Right",
     "SwingUp", "SwingDown", "SwingLeft", "SwingRight",
 ]
+
+# Bindings driven by motion rather than a button press — the ones the
+# "Motion controls" switch enables.
+MOTION_BUTTONS = frozenset(
+    {"SwingUp", "SwingDown", "SwingLeft", "SwingRight"}
+)
 
 BUTTON_LABELS = {
     "One": "1", "Two": "2", "Plus": "+", "Minus": "−",
@@ -33,6 +40,12 @@ ARROW_HOLD_MS = 3000
 
 IDLE_COLOR = "#d9d9d9"
 ACTIVE_COLOR = "#4caf50"
+# Status text while something is under way — scanning, pairing, waiting.
+BUSY_COLOR = "#ef6c00"
+# Hovering a bound key offers to clear it, in warning red.
+CLEAR_COLOR = "#c62828"
+CLEAR_TEXT = "clear"
+UNBOUND_TEXT = "—"
 
 
 class App:
@@ -42,6 +55,7 @@ class App:
         self.root.resizable(False, False)
 
         self.mappings = config.load_mappings()
+        self.settings = config.load_settings()
         self.events = queue.Queue()
         self.wiimote = Wiimote(self.events)
         self.capturing = None  # button name currently being remapped
@@ -49,17 +63,24 @@ class App:
         self.viewer = None  # MotionViewer window, when open
         self.tennis = None  # TennisPractice window, when open
         self.recorder = None  # SwingRecorder window, when open
+        self.sweeping = False  # a Bluetooth sweep is running right now
+        self.pairing = False  # the Pair button's sweep is running
+        self.connecting = False  # a manual reconnect is in flight
 
         self._build_ui()
         self.root.bind("<KeyPress>", self._on_keyboard)
         self.root.bind("<KeyRelease>", self._on_key_release)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        if self.continuous_scanning.get():
+            self.wiimote.start_scanning()
         self._reconnect()
         self.root.after(16, self._poll_events)
 
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=(10, 10, 10, 5))
+        # Connection row: what the remote is doing, and the controls that
+        # get it talking to us.
+        top = ttk.Frame(self.root, padding=(10, 10, 10, 0))
         top.pack(fill="x")
         self.status_label = ttk.Label(top, text="Connecting...")
         self.status_label.pack(side="left")
@@ -67,15 +88,46 @@ class App:
             top, text="Reconnect", command=self._reconnect
         )
         self.reconnect_btn.pack(side="right")
+        self.pair_btn = ttk.Button(
+            top, text="Pair Remote", command=self._pair
+        )
+        self.pair_btn.pack(side="right", padx=(0, 6))
+        self.continuous_scanning = tk.BooleanVar(
+            value=self.settings["continuous_scanning"]
+        )
+        self.scan_check = ttk.Checkbutton(
+            top, text="Continuous Scanning",
+            variable=self.continuous_scanning,
+            command=self._on_scanning_toggle,
+        )
+        self.scan_check.pack(side="right", padx=(0, 12))
+        if not btpair.available():
+            # No Bluetooth stack to drive: leave whatever already handed
+            # us a HID interface (a DolphinBar, say) working, but don't
+            # pretend we can go looking for remotes.
+            self.continuous_scanning.set(False)
+            self.scan_check.config(state="disabled")
+            self.pair_btn.config(state="disabled")
+
+        tools = ttk.Frame(self.root, padding=(10, 6, 10, 5))
+        tools.pack(fill="x")
         ttk.Button(
-            top, text="Motion Viewer", command=self._open_viewer
+            tools, text="Motion Viewer", command=self._open_viewer
         ).pack(side="right", padx=(0, 6))
         ttk.Button(
-            top, text="Tennis Practice", command=self._open_tennis
+            tools, text="Tennis Practice", command=self._open_tennis
         ).pack(side="right", padx=(0, 6))
         ttk.Button(
-            top, text="Swing Recorder", command=self._open_recorder
+            tools, text="Swing Recorder", command=self._open_recorder
         ).pack(side="right", padx=(0, 6))
+        # Leftmost of the right-hand group, next to its swing rows.
+        self.motion_enabled = tk.BooleanVar(
+            value=self.settings["motion_enabled"]
+        )
+        ttk.Checkbutton(
+            tools, text="Motion controls", variable=self.motion_enabled,
+            command=self._on_motion_toggle,
+        ).pack(side="right", padx=(0, 12))
 
         body = ttk.Frame(self.root)
         body.pack(fill="both")
@@ -100,12 +152,21 @@ class App:
                 table, text=BUTTON_LABELS.get(name, name), width=12
             ).grid(row=row, column=1, sticky="w")
 
-            key_label = ttk.Label(
-                table, text=self.mappings[name], width=18,
-                relief="groove", anchor="center",
+            # tk.Label rather than ttk: hovering recolours it red, and
+            # ttk themes on Windows ignore a per-widget background.
+            key_label = tk.Label(
+                table, width=18, relief="groove", anchor="center",
+                borderwidth=2,
             )
             key_label.grid(row=row, column=2, padx=8, pady=3)
             self.key_labels[name] = key_label
+            # Same for every row — the theme's own label colours.
+            self._label_bg = key_label.cget("bg")
+            self._label_fg = key_label.cget("fg")
+            key_label.bind("<Enter>", lambda e, n=name: self._hover_key(n))
+            key_label.bind("<Leave>", lambda e, n=name: self._unhover_key(n))
+            key_label.bind("<Button-1>", lambda e, n=name: self._clear_key(n))
+            self._refresh_key_label(name)
 
             set_btn = ttk.Button(
                 table, text="Set",
@@ -166,6 +227,51 @@ class App:
 
     # ---- remapping ----
 
+    def _is_active(self, name):
+        """Would this button's mapping actually fire a key right now?"""
+        if not self.mappings[name]:
+            return False
+        return name not in MOTION_BUTTONS or self.motion_enabled.get()
+
+    def _refresh_key_label(self, name):
+        """Show the current mapping, in its normal (unhovered) colours."""
+        key = self.mappings[name]
+        self.key_labels[name].config(
+            text=key or UNBOUND_TEXT,
+            bg=self._label_bg,
+            # Greyed out when unbound, and likewise while the swing
+            # bindings are switched off — either way it types nothing.
+            fg=self._label_fg if self._is_active(name) else "#888888",
+            cursor="",
+        )
+
+    def _hover_key(self, name):
+        """Offer to clear the binding under the cursor."""
+        if self.capturing == name or not self.mappings[name]:
+            return
+        self.key_labels[name].config(
+            text=CLEAR_TEXT, bg=CLEAR_COLOR, fg="white", cursor="hand2"
+        )
+
+    def _unhover_key(self, name):
+        if self.capturing == name:
+            return  # mid-capture the label shows the prompt, not the mapping
+        self._refresh_key_label(name)
+
+    def _clear_key(self, name):
+        if self.capturing == name or not self.mappings[name]:
+            return
+        self.mappings[name] = ""
+        config.save_mappings(self.mappings)
+        self._refresh_key_label(name)
+
+    def _on_motion_toggle(self):
+        self.settings["motion_enabled"] = self.motion_enabled.get()
+        config.save_settings(self.settings)
+        for name in MOTION_BUTTONS:
+            if self.capturing != name:
+                self._refresh_key_label(name)
+
     def _toggle_capture(self, name):
         if self.capturing == name:
             self._end_capture()
@@ -173,14 +279,17 @@ class App:
         if self.capturing is not None:
             self._end_capture()
         self.capturing = name
-        self.key_labels[name].config(text="press a key...")
+        self.key_labels[name].config(
+            text="press a key...", bg=self._label_bg, fg=self._label_fg,
+            cursor="",
+        )
         self.set_buttons[name].config(text="Cancel")
         self.root.focus_set()
 
     def _end_capture(self):
         name, self.capturing = self.capturing, None
         if name is not None:
-            self.key_labels[name].config(text=self.mappings[name])
+            self._refresh_key_label(name)
             self.set_buttons[name].config(text="Set")
 
     def _on_keyboard(self, event):
@@ -234,6 +343,12 @@ class App:
                 event = self.events.get_nowait()
                 if event[0] == "status":
                     self._on_status(event[1])
+                elif event[0] == "scanning":
+                    self.sweeping = event[1]
+                    self._update_status()
+                elif event[0] == "paired":
+                    self.pairing = False
+                    self._update_status()
                 elif event[0] == "gesture":
                     self._on_gesture(event[1])
                 elif event[0] == "accel":
@@ -255,15 +370,36 @@ class App:
         self.root.after(16, self._poll_events)
 
     def _on_status(self, status):
-        if status == "connected":
-            self.status_label.config(text="Connected", foreground="#2e7d32")
+        # The payload only says a connection attempt finished; whether it
+        # took is read off the remote itself, since with the scanner
+        # running two attempts can be in flight at once.
+        self.connecting = False
+        self._update_status()
+
+    def _update_status(self):
+        connected = self.wiimote.connected
+        if connected:
+            text, color = "Connected", "#2e7d32"
+        elif self.pairing:
+            text, color = ("Pairing — hold 1+2 on the remote until its "
+                           "lights stop blinking", BUSY_COLOR)
+        elif self.sweeping:
+            text, color = "Scanning for a Wii Remote...", BUSY_COLOR
+        elif self.continuous_scanning.get():
+            # The scanner is between sweeps; a remote that is on and
+            # already known to Windows joins on the next button press.
+            text, color = ("Waiting for a Wii Remote — "
+                           "press a button on it", BUSY_COLOR)
         else:
-            self.status_label.config(
-                text="Disconnected — press a button on the remote, "
-                     "then click Reconnect",
-                foreground="#c62828",
-            )
-        self.reconnect_btn.config(state="normal")
+            text, color = ("Disconnected — press a button on the remote, "
+                           "then click Reconnect", "#c62828")
+        self.status_label.config(text=text, foreground=color)
+        busy = connected or self.connecting or self.pairing
+        self.reconnect_btn.config(state="disabled" if busy else "normal")
+        self.pair_btn.config(
+            state="disabled" if self.pairing or not btpair.available()
+            else "normal"
+        )
 
     def _on_button(self, name, pressed):
         self.indicators[name].config(
@@ -285,8 +421,9 @@ class App:
                 # While remapping, don't type: our own synthetic key
                 # events would be captured as the new mapping.
                 key = self.mappings[name]
-                self.held_keys[name] = key
-                keysender.press(key)
+                if key:  # cleared bindings do nothing
+                    self.held_keys[name] = key
+                    keysender.press(key)
         else:
             # Release any held key even when the recorder took over A
             # mid-hold, so no key stays stuck down.
@@ -302,11 +439,15 @@ class App:
         # While remapping, don't fire — the user is assigning a key, not playing.
         if self.capturing is not None:
             return
-        if self.tennis is None and self.recorder is None:
+        if (self.motion_enabled.get()
+                and self.tennis is None and self.recorder is None):
             keysender.tap(self.mappings[name])
-        # else: tennis runs its own stroke detector, and the recorder is
-        # capturing practice swings — either way a swing is not a keyboard
-        # tap, and typing into whichever window has focus would be chaos.
+        # else: the motion switch is off, or tennis runs its own stroke
+        # detector and the recorder is capturing practice swings — either
+        # way a swing is not a keyboard tap, and typing into whichever
+        # window has focus would be chaos.
+        # The indicator and compass still light up regardless, so a swing
+        # that was detected but deliberately not sent stays visible.
         indicator = self.indicators[name]
         indicator.config(bg=ACTIVE_COLOR)
         self.root.after(FLASH_MS, lambda: indicator.config(bg=IDLE_COLOR))
@@ -363,14 +504,48 @@ class App:
     # ---- connection ----
 
     def _reconnect(self):
-        if self.wiimote.connected:
+        if self.wiimote.connected or self.connecting:
             return
-        self.status_label.config(text="Connecting...", foreground="")
+        self.connecting = True
+        self.status_label.config(text="Connecting...", foreground=BUSY_COLOR)
         self.reconnect_btn.config(state="disabled")
 
         def worker():
-            if not self.wiimote.connect():
-                self.events.put(("status", "disconnected"))
+            self.wiimote.connect()
+            # Always report back, even on success: connect() only
+            # announces a connection it made itself, and the scanner may
+            # well have got there first.
+            self.events.put(("status", "connected" if self.wiimote.connected
+                             else "disconnected"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_scanning_toggle(self):
+        self.settings["continuous_scanning"] = self.continuous_scanning.get()
+        config.save_settings(self.settings)
+        if self.continuous_scanning.get():
+            self.wiimote.start_scanning()
+        else:
+            self.wiimote.stop_scanning()
+        self._update_status()
+
+    def _pair(self):
+        """Pair a remote that this PC has never seen before.
+
+        Scanning alone only revives remotes Windows already knows, so a
+        fresh remote needs this once: hold 1+2 (or press sync under the
+        battery cover) and the inquiry underneath picks it up.
+        """
+        if self.pairing:
+            return
+        self.pairing = True
+        self._update_status()
+
+        def worker():
+            try:
+                self.wiimote.pair()
+            finally:
+                self.events.put(("paired", None))
 
         threading.Thread(target=worker, daemon=True).start()
 

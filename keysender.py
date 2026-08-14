@@ -67,8 +67,8 @@ def _parse(name):
     A trailing empty part means the base key is the literal "+"
     (e.g. "ctrl++"), as is a bare "+".
     """
-    if name is None:
-        return None
+    if not name:
+        return None  # unset/cleared mapping — nothing to send
     parts = name.split("+")
     if parts[-1] == "":
         parts = [p for p in parts if p] + ["+"]

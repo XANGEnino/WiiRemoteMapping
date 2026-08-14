@@ -1,9 +1,10 @@
-"""Load/save button-to-key mappings as JSON next to the app."""
+"""Load/save button-to-key mappings and app settings as JSON next to the app."""
 
 import json
 from pathlib import Path
 
 MAPPINGS_FILE = Path(__file__).resolve().parent / "mappings.json"
+SETTINGS_FILE = Path(__file__).resolve().parent / "settings.json"
 
 # Anki-friendly defaults: space = show answer / Good, 1-4 = answer buttons
 DEFAULT_MAPPINGS = {
@@ -42,4 +43,33 @@ def load_mappings():
 def save_mappings(mappings):
     MAPPINGS_FILE.write_text(
         json.dumps(mappings, indent=2), encoding="utf-8"
+    )
+
+
+DEFAULT_SETTINGS = {
+    # Off by default: an ordinary hand movement is easily mistaken for a
+    # swing, so the swing bindings only fire once switched on.
+    "motion_enabled": False,
+    # On by default: without it a remote only connects if something else
+    # (Dolphin, say) is sweeping the Bluetooth radio for it.
+    "continuous_scanning": True,
+}
+
+
+def load_settings():
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return settings
+    if isinstance(saved, dict):
+        for name, value in saved.items():
+            if name in settings and isinstance(value, type(settings[name])):
+                settings[name] = value
+    return settings
+
+
+def save_settings(settings):
+    SETTINGS_FILE.write_text(
+        json.dumps(settings, indent=2), encoding="utf-8"
     )

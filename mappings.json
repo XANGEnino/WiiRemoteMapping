@@ -1,8 +1,8 @@
 {
   "A": "space",
   "B": "ctrl+z",
-  "One": "2",
-  "Two": "3",
+  "One": "left",
+  "Two": "space",
   "Plus": "enter",
   "Minus": "9",
   "Home": "tab",
@@ -10,7 +10,7 @@
   "Down": "down",
   "Left": "left",
   "Right": "right",
-  "SwingUp": "j",
+  "SwingUp": "up",
   "SwingDown": "down",
   "SwingLeft": "left",
   "SwingRight": "right"

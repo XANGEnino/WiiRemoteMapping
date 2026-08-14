@@ -18,6 +18,9 @@ The setup sequence mirrors how Dolphin talks to real Wii remotes
   rates are streamed as ("gyro", ...) events so the viewer can show yaw,
   which the accelerometer alone cannot sense.  A remote without one
   simply gets an error back from the probe and stays accelerometer-only.
+* Continuous scanning (Dolphin's WiimoteScanner::ThreadFunc) runs a
+  background thread that keeps looking for a remote to open, falling
+  back to a Bluetooth sweep via btpair when none is attached.
 
 Protocol reference: https://wiibrew.org/wiki/Wiimote
 """
@@ -27,6 +30,7 @@ import time
 
 import hid
 
+import btpair
 from motion import SwingDetector
 
 VENDOR_ID = 0x057E
@@ -83,6 +87,13 @@ MP_FAST_SCALE = MP_SLOW_SCALE * 440.0 / 2000.0
 RETRY_S = 1.0   # resend an unacknowledged setup report after this long
 MAX_TRIES = 5   # then stop waiting for a confirmation and move on
 
+# Continuous scanning: how often the scanner checks whether a remote has
+# turned up (Dolphin's scanning thread ticks at the same rate) and how
+# long it waits between the Bluetooth sweeps, which cost several seconds
+# of radio time each and should not run back to back.
+SCAN_POLL_S = 0.5
+SCAN_SWEEP_S = 3.0
+
 # (byte index in report 0x30 payload, bit mask, button name)
 BUTTON_BITS = [
     (0, 0x01, "Left"),
@@ -107,6 +118,7 @@ class Wiimote:
     Events put on the queue:
         ("status", "connected" | "disconnected")
         ("button", <name>, <pressed: bool>)
+        ("scanning", <bool>)               # a Bluetooth sweep started/ended
         ("gesture", <swing name>)          # momentary; tap the mapped key
         ("accel", x, y, z, deviation)      # in g; only while emit_accel is set
         ("gyro", yaw, pitch, roll, dt)     # deg/s + seconds since previous
@@ -122,17 +134,30 @@ class Wiimote:
         self._stop = threading.Event()
         self._pressed = frozenset()
         self._swing = SwingDetector()
+        # connect() can be called from the GUI's reconnect worker and the
+        # scanner thread at once; without this both could open a device.
+        self._connect_lock = threading.Lock()
+        self._scan_thread = None
+        self._scan_stop = threading.Event()
         self._reset_setup()
 
     @property
     def connected(self):
         return self._device is not None
 
+    @property
+    def scanning(self):
+        return self._scan_thread is not None
+
     def connect(self):
         """Try to open the remote and start the reader thread.
 
         Returns True on success. Safe to call again after a disconnect.
         """
+        with self._connect_lock:
+            return self._connect()
+
+    def _connect(self):
         if self.connected:
             return True
         candidates = [
@@ -163,11 +188,88 @@ class Wiimote:
         return False
 
     def close(self):
+        self.stop_scanning()
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
         self._close_device()
+
+    # ---- continuous scanning ----
+
+    def start_scanning(self):
+        """Keep looking for a remote until one connects (or we're stopped).
+
+        Dolphin's "Continuous Scanning": a thread that, whenever no
+        remote is attached, asks Windows to hand one over — and when that
+        turns up nothing, sweeps the Bluetooth radio to revive a remote
+        the host already knows.  That sweep is the part that only ran
+        while Dolphin was open; without it a powered-on remote never
+        reaches hidapi at all.
+
+        Idempotent, and it keeps running across disconnects, so a remote
+        that goes to sleep comes back on its own.
+        """
+        if self.scanning:
+            return
+        # Each loop owns its stop flag.  stop_scanning() gives the handle
+        # up right away while a sweep may still be blocked in the radio
+        # for seconds; a shared flag would let the next start_scanning()
+        # clear it out from under that straggler and leave two running.
+        stop = threading.Event()
+        self._scan_stop = stop
+        self._scan_thread = threading.Thread(
+            target=self._scan_loop, args=(stop,), daemon=True
+        )
+        self._scan_thread.start()
+
+    def stop_scanning(self):
+        self._scan_stop.set()
+        thread, self._scan_thread = self._scan_thread, None
+        if thread is not None:
+            # It's a daemon thread and it has been told to stop, so don't
+            # hold the caller up waiting for a sweep to run its course.
+            thread.join(timeout=0.1)
+
+    def _scan_loop(self, stop):
+        last_sweep = 0.0
+        while not stop.is_set():
+            if not self.connected:
+                # Cheap first: a remote Windows already hands out needs
+                # no radio work at all (Dolphin's FindAttachedWiimotes).
+                if not self.connect():
+                    now = time.monotonic()
+                    if now - last_sweep >= SCAN_SWEEP_S:
+                        self._sweep(stop)
+                        last_sweep = time.monotonic()
+            stop.wait(SCAN_POLL_S)
+
+    def _sweep(self, stop):
+        """One Bluetooth sweep, then another go at opening the remote."""
+        self._queue.put(("scanning", True))
+        try:
+            found = btpair.scan()
+        except OSError:
+            found = 0  # radio pulled out mid-sweep, say
+        finally:
+            self._queue.put(("scanning", False))
+        if found and not stop.is_set():
+            self.connect()
+
+    def pair(self):
+        """Pair a remote held in discovery mode (1+2, or the sync button).
+
+        Only needed the first time a remote meets this PC — afterwards
+        scanning alone reconnects it.  Blocks for ten seconds or so, so
+        call it off the GUI thread.  Returns the number paired.
+        """
+        try:
+            paired = btpair.pair()
+        except OSError:
+            return 0
+        if paired:
+            self.connect()
+        return paired
 
     def _close_device(self):
         if self._device is not None:
